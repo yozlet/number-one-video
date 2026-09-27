@@ -1,0 +1,22 @@
+# Source material — copyrighted, and 75MB. NEVER commit these; a large file in git
+# history is effectively permanent.
+reference/video.mp4
+reference/audio/audio.wav
+
+# Derived images — every frame, contact sheet, render and mask. Gitignored for
+# two reasons: they are stills of (or derived from) a copyrighted music video,
+# and they are regenerable. The RECIPE is what gets committed, in
+# shots/MANIFEST.md, written by tools/manifest.py from the ledger
+# shots/provenance.jsonl that the tools append to as they write images (see
+# tools/prov.py). Rebuild any shot, then check its sha256 against the manifest.
+shots/**/*.png
+shots/**/*.jpg
+reference/extracted/**/*.jpg
+
+# Scratch output — regenerate with tools/*.py rather than tracking.
+shots/beats/
+
+__pycache__/
+*.pyc
+
+.DS_Store

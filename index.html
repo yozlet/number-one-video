@@ -1,0 +1,835 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Number One — Act 1 · Awakening</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #e6e2d9;
+               font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  canvas { display: block; }
+  #hud {
+    position: fixed; left: 18px; bottom: 44px; z-index: 10;
+    font-size: 11px; line-height: 1.7; color: #9c968b;
+    letter-spacing: .07em; text-transform: uppercase;
+    user-select: none; pointer-events: none;
+  }
+  #hud b { font-weight: 600; color: #5f5a52; letter-spacing: .1em; }
+  #strip {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 11;
+    display: flex; align-items: center; gap: 14px; padding: 10px 18px 14px;
+  }
+  #scrub { flex: 1; accent-color: #6f6a61; height: 3px; }
+  #clock { font-size: 11px; color: #8a857c; letter-spacing: .08em;
+           min-width: 92px; text-align: right; }
+</style>
+</head>
+<body>
+<div id="hud">
+  <b>Number One</b> — Act 1 · Awakening<br>
+  space play/pause · ← → step · <b>O</b> free orbit · scrub below
+</div>
+<div id="strip">
+  <input id="scrub" type="range" min="0" max="11.6" step="0.01" value="0">
+  <div id="clock">0.00 / 11.60</div>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.186.1/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.186.1/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls }      from 'three/addons/controls/OrbitControls.js';
+import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.js';
+import { Reflector }          from 'three/addons/objects/Reflector.js';
+import { EffectComposer }     from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass }         from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass }    from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass }         from 'three/addons/postprocessing/OutputPass.js';
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The machine is a CUBE. The front face is a full-face panel, and the CD slot
+// running across its middle IS the seam — the two halves separate along it.
+// The opening is NOT a clamshell: the top section is carried on an articulated
+// chrome two-link arm, which folds flat again and closes the machine.
+// ─────────────────────────────────────────────────────────────────────────────
+// URL options, parsed up here because several sections downstream read them.
+const PARAMS = new URLSearchParams(location.search);
+
+const S = 0.28;
+const SEAM_Y = S * 0.5;
+const SEAM_GAP = 0.0028;       // ~3mm: the reference slot reads as a distinct dark
+                               // BAR, not a hairline. At 0.6mm it vanished entirely
+                               // under any downward camera angle.
+// RoundedBox rounds ALL edges including the ones facing the split, so the visible
+// slot band is (gap + 2R). Small R keeps the slot tight at the cost of slightly
+// crisper outer edges than the reference cube has.
+const R = 0.0018;
+
+const baseH = SEAM_Y - SEAM_GAP / 2;
+const lidH  = S - SEAM_Y - SEAM_GAP / 2;
+
+const FRONT_Z = S / 2;
+const PX = 0.0005;
+
+const PANEL_W = S * 0.90;
+const HALF_H  = PANEL_W / 2;
+const CW = Math.round(PANEL_W / PX);
+const PH = Math.round(HALF_H / PX);
+
+const COLOUR = {
+  void:   0xe6e2d9,
+  metal:  0xeae6dc,
+  ledOn:  0x2bff5a,
+  ledOff: 0xd8382a,
+  groove: 0x2b2825,
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Timeline. Staging follows the reference edit, which is a WIDE shot only until
+// 2.2s and then a hard CUT to a macro on the panel — not a slow continuous move.
+// ─────────────────────────────────────────────────────────────────────────────
+const TL = {
+  duration: 11.6,
+  cut:      2.2,          // hard cut wide → macro
+  cd:      [2.2, 3.3],
+  ledOn:    4.0,
+  camSlot: [5.8, 6.4],    // tighten onto the slot itself
+  split:   [6.5, 7.5],    // the gap opens IN CLOSE-UP, then the camera eases back
+  armIn:    6.55,
+  armOut:  10.05,
+};
+
+const V = (x, y, z) => new THREE.Vector3(x, y, z);
+
+const CAM_MACRO  = { pos: V(0, 0.28, 0.44),            target: V(0, 0.055, FRONT_Z) };
+const CAM_SLOT   = { pos: V(0, SEAM_Y, FRONT_Z + 0.13), target: V(0, SEAM_Y, FRONT_Z) };
+// The lift shots want the box WIDE in frame and a SHALLOW elevation — the reference
+// camera is only ~12deg above and ~28deg round, so the front and side faces dominate
+// and the top face stays a thin parallelogram.
+const CAM_MEDIUM = { pos: V(0.36, 0.30, 0.68),          target: V(0, 0.135, 0) };
+// After the split the reference camera does NOT settle: coverage runs 60% → 60% →
+// 69% → 100% → 100%, i.e. it keeps pushing in to a full-frame shot of the
+// mechanism. Pushing in is not decoration here, it is the shot.
+const CAM_CLOSE  = { pos: V(0.25, 0.36, 0.29),          target: V(0, 0.24, 0) };
+
+// Camera keys. `cut` on a key means the pose SNAPS to it — the reference hard-cuts
+// from the wide shot to the macro at 2.2s. The split is NOT a cut: the halves part
+// while the camera is still tight on the slot, and only then does it EASE back.
+const CAM_KEYS = [
+  { t: 0.0, pos: V(0.62, 0.60, 1.92), target: V(0, 0.13, 0) },   // wide
+  { t: TL.cut, cut: true, ...CAM_MACRO },
+  { t: TL.camSlot[0], ...CAM_MACRO },                             // hold the panel macro
+  { t: TL.camSlot[1], ...CAM_SLOT },                              // tighten onto the slot
+  { t: 6.9, ...CAM_SLOT },                                        // HOLD while the gap opens
+  { t: 7.3, ...CAM_MEDIUM },                                      // ease back fast
+  { t: 7.9, ...CAM_MEDIUM },                                      // then hold at medium
+  { t: 9.2, ...CAM_CLOSE },                                       // and push back in
+];
+
+const ease = (a, b, t) => {
+  const x = THREE.MathUtils.clamp((t - a) / (b - a), 0, 1);
+  return x * x * (3 - 2 * x);
+};
+
+// Scalar keyframe track. keys = [{t, v}, ...] ascending.
+function track(keys, t) {
+  if (t <= keys[0].t) return keys[0].v;
+  for (let i = 0; i < keys.length - 1; i++) {
+    const a = keys[i], b = keys[i + 1];
+    if (t >= a.t && t < b.t) return THREE.MathUtils.lerp(a.v, b.v, ease(a.t, b.t, t));
+  }
+  return keys[keys.length - 1].v;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// preserveDrawingBuffer is required by ?bake mode: without it the drawing buffer is
+// cleared after compositing and the readback comes back blank.
+const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+// Neutral (Khronos PBR Neutral), NOT ACES — ACES crushes mid-tones and rendered
+// this studio setup as muddy grey.
+renderer.toneMapping = THREE.NeutralToneMapping;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(COLOUR.void);
+scene.fog = new THREE.Fog(COLOUR.void, 9, 34);
+
+const camera = new THREE.PerspectiveCamera(34, innerWidth / innerHeight, 0.005, 100);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.06;
+controls.minDistance = 0.08;
+controls.maxDistance = 4;
+controls.maxPolarAngle = Math.PI * 0.495;
+
+// Camera keys are defined above, next to the timeline.
+function evalCamera(t) {
+  if (t <= CAM_KEYS[0].t) return { pos: CAM_KEYS[0].pos, target: CAM_KEYS[0].target };
+  for (let i = 0; i < CAM_KEYS.length - 1; i++) {
+    const a = CAM_KEYS[i], b = CAM_KEYS[i + 1];
+    if (t >= a.t && t < b.t) {
+      // A cut means the whole preceding segment holds pose `a` and snaps at b.
+      if (b.cut) return { pos: a.pos, target: a.target };
+      const k = ease(a.t, b.t, t);
+      return { pos: a.pos.clone().lerp(b.pos, k), target: a.target.clone().lerp(b.target, k) };
+    }
+  }
+  const last = CAM_KEYS[CAM_KEYS.length - 1];
+  return { pos: last.pos, target: last.target };
+}
+
+// The wide shot is deliberately blown out — the reference is near-white until the
+// cut, and the panel detail only resolves in the macro.
+const exposureAt = (t) => (t < TL.cut ? 1.70 : 0.88);
+
+// Graded studio environment. Brushed metal takes ALL its colour from reflections,
+// so a uniform white environment renders it flat white with no gradient at all.
+// The horizon band must stay BRIGHT: a box's front faces reflect exactly that band.
+function studioEnv() {
+  const c = document.createElement('canvas');
+  c.width = 32; c.height = 256;
+  const g = c.getContext('2d');
+  const grad = g.createLinearGradient(0, 0, 0, 256);
+  grad.addColorStop(0.00, '#ffffff');
+  grad.addColorStop(0.38, '#fdfbf6');
+  grad.addColorStop(0.50, '#f2eee6');
+  grad.addColorStop(0.64, '#dcd7cd');
+  grad.addColorStop(1.00, '#aaa59c');
+  g.fillStyle = grad;
+  g.fillRect(0, 0, 32, 256);
+  const t = new THREE.CanvasTexture(c);
+  t.mapping = THREE.EquirectangularReflectionMapping;
+  t.colorSpace = THREE.SRGBColorSpace;
+  return t;
+}
+
+const pmrem = new THREE.PMREMGenerator(renderer);
+scene.environment = pmrem.fromEquirectangular(studioEnv()).texture;
+
+// Satin brushed aluminium, not chrome. metalness:1 takes every bit of colour from
+// the environment and the lights can't shape the form at all.
+// NOTE: no `anisotropy` — it is UV-scale dependent, so parts sharing a 0-1 UV at
+// different sizes render at visibly different roughness.
+const brushed = (opts = {}) => new THREE.MeshPhysicalMaterial({
+  color: COLOUR.metal, metalness: 0.45, roughness: 0.5, envMapIntensity: 1.2, ...opts,
+});
+
+const matBody   = brushed();
+const matGroove = new THREE.MeshStandardMaterial({
+  color: COLOUR.groove, metalness: 0.4, roughness: 0.85,
+});
+// Chromed, but not a pure mirror: at metalness 1 the diffuse term is zero, so
+// under the lifted lid the mechanism fell back to environment light alone and
+// rendered as a dark blob. Keeping some diffuse lets the lights play on it.
+const matChrome = new THREE.MeshPhysicalMaterial({
+  color: 0xe9ecf0, metalness: 0.75, roughness: 0.22, envMapIntensity: 2.0,
+});
+// BoxGeometry takes one material per face, order +x, -x, +y, -y, +z, -z. The groove
+// is a wide sub-millimetre slab: you see its EDGES through the slot, but once the
+// lid swings open its broad faces turn to face the camera. Dark everywhere meant a
+// 275mm black rectangle the moment it opened.
+const grooveMats = [matGroove, matGroove, matBody, matBody, matGroove, matGroove];
+
+function makePanel(which) {
+  const c = document.createElement('canvas');
+  c.width = CW; c.height = PH;
+  const g = c.getContext('2d');
+
+  const engrave = (draw) => {
+    g.save();
+    g.strokeStyle = g.fillStyle = 'rgba(38,34,29,0.50)';
+    draw();
+    g.restore();
+  };
+  // The reference engraves PLAYGROUP tracked right out, so draw it per glyph.
+  const tracked = (text, cx, y, tracking) => {
+    const chars = [...text];
+    const widths = chars.map((ch) => g.measureText(ch).width);
+    let x = cx - (widths.reduce((a, b) => a + b, 0) + tracking * (chars.length - 1)) / 2;
+    chars.forEach((ch, i) => { g.fillText(ch, x, y); x += widths[i] + tracking; });
+  };
+
+  g.textBaseline = 'middle';
+  // Both labels are small and sit low on the panel. In the reference, POWER is
+  // level with the SLOT and the LED is only ~7mm above it — not a big legend
+  // floating high on the face, which is what an earlier build had.
+  if (which === 'upper') {
+    engrave(() => { g.font = '600 14px ui-monospace, Menlo, monospace'; g.fillText('POWER', 42, 240); });
+  } else {
+    engrave(() => { g.font = '500 13px ui-monospace, Menlo, monospace'; tracked('PLAYGROUP', CW / 2, 150, 3); });
+  }
+
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace;
+  t.anisotropy = 8;
+  return t;
+}
+
+const pxX = (px) => (px - CW / 2) * PX;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The machine. Both halves are origin-anchored Groups so a child's local position
+// equals its world position — parenting to an already-offset mesh silently adds
+// that offset again.
+// ─────────────────────────────────────────────────────────────────────────────
+const machine = new THREE.Group();
+scene.add(machine);
+
+const base = new THREE.Group();
+machine.add(base);
+const baseBody = new THREE.Mesh(new RoundedBoxGeometry(S, baseH, S, 4, R), matBody);
+baseBody.position.y = baseH / 2;
+base.add(baseBody);
+
+const panelLower = new THREE.Mesh(
+  new THREE.PlaneGeometry(PANEL_W, HALF_H),
+  new THREE.MeshBasicMaterial({
+    map: makePanel('lower'), transparent: true, depthWrite: false, toneMapped: false,
+  })
+);
+panelLower.position.set(0, SEAM_Y - HALF_H / 2, FRONT_Z + 0.0018);
+base.add(panelLower);
+
+// Pivot at the lid's own centre, at slot height. With the pivot at the REAR edge
+// (the natural "hinge") rotating merely swings the lid away from the lower box,
+// but the reference holds the lid above it and tilts it in place.
+const lid = new THREE.Group();
+lid.position.set(0, SEAM_Y, 0);
+machine.add(lid);
+
+const lidBody = new THREE.Mesh(new RoundedBoxGeometry(S, lidH, S, 4, R), matBody);
+lidBody.position.set(0, SEAM_GAP / 2 + lidH / 2, 0);
+lid.add(lidBody);
+
+const groove = new THREE.Mesh(
+  new THREE.BoxGeometry(S - 0.005, SEAM_GAP, S - 0.005), grooveMats
+);
+groove.position.set(0, 0, 0);            // exactly in the slot
+lid.add(groove);
+
+const panelUpper = new THREE.Mesh(
+  new THREE.PlaneGeometry(PANEL_W, HALF_H),
+  new THREE.MeshBasicMaterial({
+    map: makePanel('upper'), transparent: true, depthWrite: false, toneMapped: false,
+  })
+);
+panelUpper.position.set(0, HALF_H / 2, FRONT_Z + 0.0018);
+lid.add(panelUpper);
+
+const led = new THREE.Mesh(
+  new THREE.CircleGeometry(0.0042, 24),
+  new THREE.MeshBasicMaterial({ color: COLOUR.ledOff, toneMapped: false })
+);
+led.position.set(pxX(50), HALF_H - 224 * PX, FRONT_Z + 0.0022);
+lid.add(led);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ROBOT BLOCKOUT RIG
+//
+// Proportions measured off a full-body reference frame (shots/rig/robot_120.5.png),
+// expressed as fractions of total height H so absolute scale can change without
+// touching any of this. Verified landmarks, fractions of height from the floor:
+//
+//   ankle 0.029 · knee 0.272 · hip 0.426 · waist 0.559 · torso bottom 0.596
+//   shoulder 0.787 · torso top 0.875 · head top 1.000
+//
+// The reference robot is LANKY: shoulder span is only 0.27 of its height. The shins
+// are the widest limb elements (0.162 of height, far bigger than the thighs) and the
+// arms are thin and long, hanging to mid-thigh.
+//
+// This is a BLOCKOUT: correct proportions and correct pivots, crude geometry. Pivots
+// are what break animation — surface detail does not move a joint centre, so panels,
+// cables and chrome can all come later without re-keying anything.
+// ─────────────────────────────────────────────────────────────────────────────
+const H = 2.2;
+
+const P = {
+  ankle: 0.029, knee: 0.272, hip: 0.426, waist: 0.559,
+  torsoBot: 0.596, torsoTop: 0.875, shoulder: 0.787, headTop: 1.0,
+  shoulderSpan: 0.272, torsoW: 0.128, headW: 0.213,
+  shinW: 0.162, hipSpan: 0.105, armW: 0.055, hand: 0.030,
+};
+
+const matRig   = new THREE.MeshPhysicalMaterial({ color: 0xeceade, metalness: 0.35, roughness: 0.55 });
+const matJoint = new THREE.MeshPhysicalMaterial({ color: 0x9fa4aa, metalness: 0.85, roughness: 0.3 });
+
+const robot = new THREE.Group();
+robot.visible = false;
+scene.add(robot);
+
+const joints = {};   // name -> Group, pivot at the joint centre
+
+function joint(name, parent, x, y, z) {
+  const g = new THREE.Group();
+  g.position.set(x, y, z);
+  parent.add(g);
+  joints[name] = g;
+  return g;
+}
+
+// A segment hangs DOWN from its pivot, so its mesh sits at -h/2.
+function seg(parent, w, h, d, mat = matRig, drop = 1) {
+  const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat);
+  m.position.y = -h / 2 * drop;
+  parent.add(m);
+  return m;
+}
+
+function pivotBall(parent, r = 0.035) {
+  parent.add(new THREE.Mesh(new THREE.SphereGeometry(r, 12, 8), matJoint));
+}
+
+const y = (frac) => frac * H;
+
+// Arm landmarks, measured from the same reference frame:
+//   shoulder 0.787 · elbow 0.625 · hand 0.456   -> upper 0.162H, forearm 0.169H
+const ARM_UP = 0.162, ARM_LO = 0.169, ARM_W = 0.052;
+
+// Every local offset below is a DIFFERENCE of absolute height fractions. Using an
+// absolute fraction as a parent-relative offset places the part far too high —
+// it put the head at 3.15m on a 2.2m robot.
+
+// ── lower body ──
+const root = joint('root', robot, 0, 0, 0);
+const hips = joint('hips', root, 0, y(P.hip), 0);
+
+// pelvis block, spanning upward from the hips
+const pelvis = new THREE.Mesh(
+  new THREE.BoxGeometry(y(P.torsoW), y(0.085), y(P.torsoW) * 0.85), matJoint);
+pelvis.position.y = y(0.042);
+hips.add(pelvis);
+
+for (const side of [-1, 1]) {
+  const s = side < 0 ? 'L' : 'R';
+  const hip = joint(`hip${s}`, hips, side * y(P.hipSpan), 0, 0);
+  pivotBall(hip, 0.045);
+  seg(hip, y(0.075), y(P.hip - P.knee), y(0.075));                  // thigh
+  const knee = joint(`knee${s}`, hip, 0, -y(P.hip - P.knee), 0);
+  pivotBall(knee, 0.042);
+  // SHIN is the big flat panel — the most distinctive element on the robot
+  seg(knee, y(P.shinW), y(P.knee - P.ankle), y(0.055));
+  const ankle = joint(`ankle${s}`, knee, 0, -y(P.knee - P.ankle), 0);
+  pivotBall(ankle, 0.032);
+  const foot = new THREE.Mesh(
+    new THREE.BoxGeometry(y(0.085), y(0.028), y(0.17)), matJoint);
+  foot.position.set(0, -y(0.020), y(0.045));
+  ankle.add(foot);
+}
+
+// ── upper body ──
+const waist = joint('waist', hips, 0, y(P.waist - P.hip), 0);
+const waistJoint = new THREE.Mesh(
+  new THREE.CylinderGeometry(y(0.035), y(0.035), y(0.05), 16), matJoint);
+waistJoint.position.y = y(0.025);
+waist.add(waistJoint);
+
+const torsoBase = y(P.torsoBot - P.waist);
+const torsoH = (P.torsoTop - P.torsoBot) * H;
+const torso = new THREE.Mesh(
+  new THREE.BoxGeometry(y(P.torsoW), torsoH, y(P.torsoW) * 0.8), matRig);
+torso.position.y = torsoBase + torsoH / 2;
+waist.add(torso);
+
+// head box sits ON the torso top, wider than the torso
+const headH = (P.headTop - P.torsoTop) * H * 0.9;
+const headMesh = new THREE.Mesh(
+  new THREE.BoxGeometry(y(P.headW), headH, y(P.headW) * 0.72), matRig);
+headMesh.position.y = y(P.torsoTop - P.waist) + headH / 2;
+waist.add(headMesh);
+const head = joint('head', waist, 0, y(P.torsoTop - P.waist), 0);
+
+for (const side of [-1, 1]) {
+  const s = side < 0 ? 'L' : 'R';
+  const sh = joint(`shoulder${s}`, waist,
+                   side * y(P.shoulderSpan / 2), y(P.shoulder - P.waist), 0);
+  pivotBall(sh, 0.05);
+  seg(sh, y(ARM_W), y(ARM_UP), y(ARM_W));                           // upper arm
+  const el = joint(`elbow${s}`, sh, 0, -y(ARM_UP), 0);
+  pivotBall(el, 0.038);
+  seg(el, y(ARM_W) * 0.9, y(ARM_LO), y(ARM_W) * 0.9);               // forearm
+  const wr = joint(`wrist${s}`, el, 0, -y(ARM_LO), 0);
+  seg(wr, y(P.hand), y(P.hand) * 1.6, y(P.hand) * 0.55, matJoint);  // hand plate
+}
+
+// ── pose harness ──
+// ?pose=shoulderL.x=-30,elbowL.x=-70,waist.y=20
+// Lets a STATIC pose be diffed against a reference frame, so the rig can be
+// verified before any choreography is keyed onto it. Pivots are what break
+// animation; this is how we find out they are wrong while it is still cheap.
+function applyPose(spec) {
+  if (!spec) return;
+  for (const item of spec.split(',')) {
+    const [name, val] = item.split('=');
+    const [jn, axis] = name.split('.');
+    if (!joints[jn] || !val) continue;
+    const deg = parseFloat(val);
+    if (!Number.isFinite(deg)) continue;
+    joints[jn].rotation[axis || 'x'] = THREE.MathUtils.degToRad(deg);
+  }
+}
+
+
+// ── the CD ── horizontal disc (axis along Y) so it slides edge-on into the slot
+const CD_R = 0.06;
+const cd = new THREE.Mesh(
+  new THREE.CylinderGeometry(CD_R, CD_R, 0.0007, 64),
+  new THREE.MeshPhysicalMaterial({ color: 0xffffff, metalness: 0.35, roughness: 0.25 })
+);
+cd.position.set(0, SEAM_Y, FRONT_Z + CD_R);
+machine.add(cd);
+
+// ── the articulated arm ──
+// Two chrome links with a knuckle between them, anchored to the base and to the
+// lid's underside. Driving the knuckle from the lid's actual transform (2-link IK)
+// rather than hand-keying angles means the mechanism can never visually detach —
+// and it lies naturally flat when the anchors are close, which is exactly the
+// folded-down state in the reference.
+const arm = new THREE.Group();
+machine.add(arm);
+
+const LINK_R = 0.0055;
+// Reach must exceed the lid's maximum lift separation, or the IK clamps and the two
+// links snap into a single straight rod with a visible gap to the lid.
+const L1 = 0.085, L2 = 0.085;
+const linkGeo = new THREE.CylinderGeometry(LINK_R, LINK_R, 1, 14);
+const linkA = new THREE.Mesh(linkGeo, matChrome);
+const linkB = new THREE.Mesh(linkGeo, matChrome);
+const knuckle = new THREE.Mesh(new THREE.SphereGeometry(LINK_R * 1.45, 16, 12), matChrome);
+arm.add(linkA, linkB, knuckle);
+
+const BASE_ANCHOR = V(0, SEAM_Y, -FRONT_Z + 0.055);
+const LID_ANCHOR_LOCAL = V(0, 0, -FRONT_Z + 0.055);   // lid-local: underside, rear
+
+function orientLink(mesh, a, b) {
+  const dir = new THREE.Vector3().subVectors(b, a);
+  mesh.position.copy(a).addScaledVector(dir, 0.5);
+  mesh.quaternion.setFromUnitVectors(V(0, 1, 0), dir.clone().normalize());
+  mesh.scale.set(1, Math.max(dir.length(), 1e-5), 1);
+}
+
+// Planar 2-link IK in the YZ plane. Picks the elbow that points UP, giving the
+// inverted-V stance the reference arm has.
+function solveArm() {
+  lid.updateMatrixWorld(true);
+  const target = lid.localToWorld(LID_ANCHOR_LOCAL.clone());
+  const dy = target.y - BASE_ANCHOR.y;
+  const dz = target.z - BASE_ANCHOR.z;
+
+  let d = Math.hypot(dy, dz);
+  const lo = Math.abs(L1 - L2) + 1e-5, hi = L1 + L2 - 1e-5;
+  d = THREE.MathUtils.clamp(d, lo, hi);
+
+  const uy = dy / Math.max(Math.hypot(dy, dz), 1e-9);
+  const uz = dz / Math.max(Math.hypot(dy, dz), 1e-9);
+  const along = (L1 * L1 - L2 * L2 + d * d) / (2 * d);
+  const h = Math.sqrt(Math.max(0, L1 * L1 - along * along));
+
+  const my = BASE_ANCHOR.y + along * uy;
+  const mz = BASE_ANCHOR.z + along * uz;
+  const e1 = { y: my - h * uz, z: mz + h * uy };
+  const e2 = { y: my + h * uz, z: mz - h * uy };
+  const e = e1.y > e2.y ? e1 : e2;
+  const elbow = V(0, e.y, e.z);
+
+  orientLink(linkA, BASE_ANCHOR, elbow);
+  orientLink(linkB, elbow, target);
+  knuckle.position.copy(elbow);
+}
+
+machine.traverse((o) => { if (o.isMesh) o.castShadow = true; });
+
+// ─────────────────────────────────────────────────────────────────────────────
+const mirror = new Reflector(new THREE.PlaneGeometry(30, 30), {
+  clipBias: 0.003, textureWidth: 1024, textureHeight: 1024, color: 0xccc8bf,
+});
+mirror.rotation.x = -Math.PI / 2;
+scene.add(mirror);
+
+const shadowCatcher = new THREE.Mesh(
+  new THREE.PlaneGeometry(30, 30), new THREE.ShadowMaterial({ opacity: 0.16 })
+);
+shadowCatcher.rotation.x = -Math.PI / 2;
+shadowCatcher.position.y = 0.0006;
+shadowCatcher.receiveShadow = true;
+scene.add(shadowCatcher);
+
+// scenery, not subject — kept out of the mask pass so the silhouette is the machine
+const maskExclude = [mirror, shadowCatcher];
+
+// Blockout-rig mode: show the robot, hide Act 1 entirely. Deferred to here because
+// it needs mirror/shadowCatcher, which are built after the rig itself.
+const RIG_MODE = PARAMS.get('rig') === '1';
+if (RIG_MODE) {
+  robot.visible = true;
+  machine.visible = false;
+  mirror.visible = false;
+  shadowCatcher.visible = false;
+  applyPose(PARAMS.get('pose'));
+  // frame the full standing figure: H plus margin at 34deg
+  const d = (H * 1.06) / (2 * Math.tan(THREE.MathUtils.degToRad(17)));
+  camera.position.set(0, H * 0.5, d);
+  controls.target.set(0, H * 0.5, 0);
+  camera.lookAt(controls.target);
+  if (PARAMS.get('angle')) {
+    const a = THREE.MathUtils.degToRad(parseFloat(PARAMS.get('angle')));
+    camera.position.set(Math.sin(a) * d, H * 0.5, Math.cos(a) * d);
+    camera.lookAt(controls.target);
+  }
+}
+
+// Lights. Intensities are ~3x what you'd guess: three.js r155+ is physically
+// correct and the Lambert BRDF carries a 1/PI, so a directional light needs ~5.
+const key = new THREE.DirectionalLight(0xfff6ec, 5.0);
+key.position.set(1.6, 2.4, 1.9);
+key.castShadow = true;
+key.shadow.mapSize.set(2048, 2048);
+key.shadow.radius = 4;
+key.shadow.bias = -0.0005;
+Object.assign(key.shadow.camera, { left: -0.5, right: 0.5, top: 0.6, bottom: -0.4, near: 0.5, far: 8 });
+key.shadow.camera.updateProjectionMatrix();
+scene.add(key);
+
+const fill = new THREE.DirectionalLight(0xf4f8ff, 0.9);
+fill.position.set(-2.4, 1.1, 1.0);
+scene.add(fill);
+
+const rim = new THREE.DirectionalLight(0xffffff, 0.9);
+rim.position.set(-0.6, 1.6, -2.2);
+scene.add(rim);
+
+scene.add(new THREE.HemisphereLight(0xffffff, 0xdedad2, 0.5));
+
+const composer = new EffectComposer(renderer);
+composer.addPass(new RenderPass(scene, camera));
+composer.addPass(new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 0.22, 0.6, 0.97));
+composer.addPass(new OutputPass());
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Everything animated is a pure function of t, so scrubbing backwards is exact.
+// ─────────────────────────────────────────────────────────────────────────────
+// The lid is CARRIED, not hinged. It rises nearly PARALLEL (the reference holds it
+// level through the lift) and only tilts much later and much harder — about 40deg
+// by 9.0s, with its underside swinging into view. dy is from the rest position.
+const LID_DY = [
+  { t: 0.0, v: 0 },
+  { t: TL.split[0], v: 0 },
+  { t: 7.5, v: 0.020 },
+  { t: 8.3, v: 0.075 },
+  { t: 9.0, v: 0.105 },
+  { t: 9.4, v: 0.105 },
+  { t: 9.9, v: 0 },
+];
+const LID_RX = [
+  { t: 0.0, v: 0 },
+  { t: TL.split[0], v: 0 },
+  { t: 8.2, v: 0 },
+  { t: 8.6, v: -0.45 },
+  { t: 9.2, v: -0.75 },
+  { t: 9.5, v: -0.75 },
+  { t: 9.9, v: 0 },
+];
+
+function apply(t) {
+  // In rig mode the timeline must not touch anything: it would drag the camera back
+  // to the Act 1 framing and re-expose for the blown-out wide shot.
+  if (RIG_MODE) {
+    renderer.toneMappingExposure = 0.88;
+    return;
+  }
+  renderer.toneMappingExposure = exposureAt(t);
+
+  led.material.color.set(t >= TL.ledOn ? COLOUR.ledOn : COLOUR.ledOff);
+
+  // CD slides in along Z; hidden once fully behind the front plane, where the cube
+  // occludes it anyway, so there is no pop.
+  const cdK = ease(TL.cd[0], TL.cd[1], t);
+  cd.position.z = THREE.MathUtils.lerp(FRONT_Z + CD_R, FRONT_Z - CD_R, cdK);
+  cd.visible = t >= TL.cd[0] && cd.position.z > FRONT_Z - CD_R + 1e-4;
+
+  lid.position.y = SEAM_Y + track(LID_DY, t);
+  lid.rotation.x = track(LID_RX, t);
+
+  // The mechanism has nowhere to hide while the machine is shut (the halves are
+  // solid), so it only exists while the gap is open.
+  arm.visible = t >= TL.armIn && t <= TL.armOut;
+  if (arm.visible) solveArm();
+
+  if (!freeOrbit) {
+    const { pos, target } = evalCamera(t);
+    camera.position.copy(pos);
+    controls.target.copy(target);
+    camera.lookAt(controls.target);
+    // Deliberately no controls.update() here: the timeline drives the camera
+    // directly, and damping would fight it.
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+const scrub = document.getElementById('scrub');
+const clock = document.getElementById('clock');
+scrub.max = TL.duration;
+
+let t = 0, playing = true, freeOrbit = false;
+const timer = new THREE.Clock();
+
+// ?t=6.5 jumps to a beat and holds it. ?ui=0 hides the HUD for clean comparisons.
+const params = PARAMS;
+if (params.has('t')) { t = parseFloat(params.get('t')) || 0; playing = false; }
+if (params.get('orbit') === '1') freeOrbit = true;
+if (params.get('ui') === '0') {
+  for (const id of ['hud', 'strip']) document.getElementById(id).style.display = 'none';
+}
+
+// explicit timeline positions to bake, e.g. ?bakeTs=1.0,2.8,6.9
+// NOTE: filter empty fields BEFORE Number(). Number('') is 0, not NaN, so an
+// absent bakeTs produced [0] and silently put the page into bake mode.
+const BAKE_TS = (PARAMS.get('bakeTs') || '')
+  .split(',').map((v) => v.trim()).filter((v) => v !== '')
+  .map(Number).filter((v) => Number.isFinite(v));
+
+function syncUI() {
+  if (document.activeElement !== scrub) scrub.value = t;
+  clock.textContent = `${t.toFixed(2)} / ${TL.duration.toFixed(2)}`;
+}
+
+addEventListener('keydown', (e) => {
+  if (e.key === ' ')               { playing = !playing; e.preventDefault(); }
+  else if (e.key === 'ArrowRight') { t = Math.min(TL.duration, t + (e.shiftKey ? 0.5 : 0.05)); playing = false; }
+  else if (e.key === 'ArrowLeft')  { t = Math.max(0, t - (e.shiftKey ? 0.5 : 0.05)); playing = false; }
+  else if (e.key === 'o' || e.key === 'O') {
+    freeOrbit = !freeOrbit;
+    controls.enabled = freeOrbit;
+    if (freeOrbit) { controls.target.set(0, 0.01, 0); camera.position.set(0.69, 0.35, 0.98); }
+  }
+  apply(t); syncUI();
+});
+
+scrub.addEventListener('input', () => {
+  t = parseFloat(scrub.value);
+  playing = false;
+  apply(t); syncUI();
+});
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+  composer.setSize(innerWidth, innerHeight);
+});
+
+// Mask pass: rendered from the scene graph, not inferred by segmentation. We
+// authored the scene, so we already know what is visible — inferring the
+// silhouette with computer vision was self-inflicted difficulty. Rendered WITHOUT
+// the composer (no bloom, no tone mapping) so it comes out binary.
+const maskMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
+
+function renderMaskTo(ctx, dx, dy, w, h) {
+  const prevBg = scene.background, prevOverride = scene.overrideMaterial;
+  const prevFog = scene.fog, prevTone = renderer.toneMapping;
+  const hidden = [];
+  for (const o of maskExclude) {
+    if (o.visible) { o.visible = false; hidden.push(o); }
+  }
+  scene.background = new THREE.Color(0x000000);
+  scene.overrideMaterial = maskMat;
+  scene.fog = null;
+  renderer.toneMapping = THREE.NoToneMapping;
+  renderer.render(scene, camera);
+  ctx.drawImage(renderer.domElement, dx, dy, w, h);
+
+  scene.background = prevBg;
+  scene.overrideMaterial = prevOverride;
+  scene.fog = prevFog;
+  renderer.toneMapping = prevTone;
+  for (const o of hidden) o.visible = true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Bake mode: render a LIST of timeline positions into one canvas, so a whole
+// sweep costs a single browser launch instead of one per frame. That launch cost
+// (8-20s each) is the real bottleneck in this loop, more than tokens.
+//
+//   ?bakeTs=1.0,2.8,6.9&cols=4&w=384&h=216
+//
+// Emits TWO bands of tiles: beauty on top, exact SILHOUETTE below.
+// The window must be at least cols*w x 2*rows*h for the screenshot to capture it;
+// tools/diff.py computes that and passes it to shoot.sh.
+// ─────────────────────────────────────────────────────────────────────────────
+function runBake(ts) {
+  const cols = parseInt(params.get('cols') ?? '8', 10);
+  const w = parseInt(params.get('w') ?? '384', 10);
+  const h = parseInt(params.get('h') ?? '216', 10);
+  const rows = Math.ceil(ts.length / cols);
+
+  for (const id of ['hud', 'strip']) {
+    const el = document.getElementById(id);
+    if (el) el.style.display = 'none';
+  }
+
+  renderer.setPixelRatio(1);
+  renderer.setSize(w, h);
+  composer.setSize(w, h);
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+
+  const sheet = document.createElement('canvas');
+  sheet.width = cols * w;
+  sheet.height = 2 * rows * h;
+  const ctx = sheet.getContext('2d');
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, sheet.width, sheet.height);
+
+  for (let i = 0; i < ts.length; i++) {
+    apply(ts[i]);
+    const bx = (i % cols) * w, by = Math.floor(i / cols) * h;
+    composer.render();
+    ctx.drawImage(renderer.domElement, bx, by, w, h);
+    renderMaskTo(ctx, bx, by + rows * h, w, h);
+  }
+
+  document.title = `BAKE ${sheet.width}x${sheet.height}`;
+  document.body.innerHTML = '';
+  document.body.style.cssText = 'margin:0;overflow:hidden;background:#000';
+  document.body.appendChild(sheet);
+}
+
+function startPlayback() {
+  if (freeOrbit) {
+    controls.enabled = true;
+    controls.target.set(0, 0.01, 0);
+    camera.position.set(0.69, 0.35, 0.98);
+  }
+  controls.enabled = freeOrbit;
+  apply(t);
+  syncUI();
+
+  renderer.setAnimationLoop(() => {
+    const dt = timer.getDelta();
+    if (playing) {
+      t += dt;
+      if (t > TL.duration) t -= TL.duration;
+      apply(t);
+      syncUI();
+    }
+    if (freeOrbit) controls.update();
+    composer.render();
+  });
+}
+
+if (BAKE_TS.length) runBake(BAKE_TS);
+else startPlayback();
+</script>
+</body>
+</html>
